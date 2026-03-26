@@ -76,12 +76,12 @@ void music_visualizer_view_update(const uint8_t *amplitudes,
                                   const char *artist_name);
 
 // Defines for Wireshark channel validation
-#if !defined(MAX_WIFI_CHANNEL)
 #if defined(CONFIG_IDF_TARGET_ESP32C5)
 #define MAX_WIFI_CHANNEL 165
+#elif defined(CONFIG_IDF_TARGET_ESP32C6)
+#define MAX_WIFI_CHANNEL 13
 #else
 #define MAX_WIFI_CHANNEL 13
-#endif
 #endif
 
 #define MAX_DEVICES 255
@@ -106,7 +106,7 @@ static volatile bool live_ap_hopping_active = false;
 static uint32_t last_live_print_ms = 0;
 static uint16_t live_last_printed_index = 0;
 
-#if defined(CONFIG_IDF_TARGET_ESP32C5) || defined(CONFIG_IDF_TARGET_ESP32C6)
+#if defined(CONFIG_IDF_TARGET_ESP32C5)
 static const uint8_t live_ap_channels[] = {
     1,2,3,4,5,6,7,8,9,10,11,12,13,
     36,40,44,48,52,56,60,64,
@@ -395,7 +395,15 @@ static inline bool stream_buf_lock(void) {
     }
     if (xSemaphoreTake(g_stream_buf_mutex, portMAX_DELAY) != pdTRUE) return false;
     if (g_stream_buf == NULL) {
-        g_stream_buf = (char *)heap_caps_malloc(CHUNK_SIZE + 1, MALLOC_CAP_8BIT);
+#if CONFIG_SPIRAM
+        g_stream_buf = (char *)heap_caps_malloc(CHUNK_SIZE + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (g_stream_buf == NULL) {
+            ESP_LOGW(TAG, "PSRAM g_stream_buf failed, trying internal RAM");
+            g_stream_buf = (char *)malloc(CHUNK_SIZE + 1);
+        }
+#else
+        g_stream_buf = (char *)malloc(CHUNK_SIZE + 1);
+#endif
         if (g_stream_buf == NULL) {
             xSemaphoreGive(g_stream_buf_mutex);
             return false;
@@ -1403,7 +1411,16 @@ esp_err_t wifi_manager_start_evil_portal(const char *URLorFilePath, const char *
                 long pf_size = ftell(pf);
                 rewind(pf);
                 if (pf_size > 0) {
-                    char *pf_buf = malloc((size_t)pf_size + 1);
+                    char *pf_buf = NULL;
+#if CONFIG_SPIRAM
+                    pf_buf = (char*)heap_caps_malloc((size_t)pf_size + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                    if (pf_buf == NULL) {
+                        ESP_LOGW(TAG, "PSRAM portal_file_cache failed, trying internal RAM");
+                        pf_buf = malloc((size_t)pf_size + 1);
+                    }
+#else
+                    pf_buf = malloc((size_t)pf_size + 1);
+#endif
                     if (pf_buf != NULL) {
                         size_t pf_read = fread(pf_buf, 1, (size_t)pf_size, pf);
                         pf_buf[pf_read] = '\0';
@@ -1494,21 +1511,8 @@ esp_err_t wifi_manager_start_evil_portal(const char *URLorFilePath, const char *
     esp_wifi_set_ps(WIFI_PS_NONE);
 
     // be conservative for client compatibility (2.4GHz only, HT20 for max compatibility)
-#if defined(CONFIG_IDF_TARGET_ESP32C5) || defined(CONFIG_IDF_TARGET_ESP32C6)
-    {
-        // Dual-band chips in WIFI_BAND_MODE_AUTO require the plural APIs
-        wifi_bandwidths_t bws = { .ghz_2g = WIFI_BW_HT20, .ghz_5g = WIFI_BW_HT20 };
-        (void)esp_wifi_set_bandwidths(WIFI_IF_AP, &bws);
-        wifi_protocols_t p = {
-            .ghz_2g = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N,
-            .ghz_5g = WIFI_PROTOCOL_11A | WIFI_PROTOCOL_11N,
-        };
-        (void)esp_wifi_set_protocols(WIFI_IF_AP, &p);
-    }
-#else
     (void)esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
     (void)esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-#endif
     dnsserver.ip.u_addr.ip4.addr = esp_ip4addr_aton("192.168.4.1");
     dnsserver.ip.type = ESP_IPADDR_TYPE_V4;
     ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &ap_config));
@@ -1742,12 +1746,14 @@ void wifi_manager_stop_monitor_mode() {
 }
 
 void wifi_manager_init(void) {
+    size_t mem_start = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    ESP_LOGI(TAG, "wifi_manager_init: starting with %d bytes INTERNAL RAM free", (int)mem_start);
 
     // --- Memory check before WiFi init ---
-    size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     if (free_heap < (45 * 1024)) {
-        ESP_LOGW(TAG, "WARNING: Less than 45KB of free RAM available (%d bytes). WiFi may fail to initialize or operate reliably!", (int)free_heap);
-        TERMINAL_VIEW_ADD_TEXT("WARNING: <45KB RAM free (%d bytes). WiFi may not initialize or operate reliably!\n", (int)free_heap);
+        ESP_LOGW(TAG, "WARNING: Less than 45KB of free internal RAM available (%d bytes). WiFi may fail to initialize or operate reliably!", (int)free_heap);
+        TERMINAL_VIEW_ADD_TEXT("WARNING: <45KB internal RAM free (%d bytes). WiFi may not initialize or operate reliably!\n", (int)free_heap);
     }
 
     esp_log_level_set("wifi", ESP_LOG_ERROR); // Only show errors, not warnings
@@ -1755,22 +1761,34 @@ void wifi_manager_init(void) {
     // Disable WiFi power saving to improve connection stability
     esp_wifi_set_ps(WIFI_PS_NONE);
 
+    ESP_LOGI(TAG, "wifi_manager: initializing NVS...");
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
     }
+    ESP_LOGI(TAG, "wifi_manager: NVS init done, free internal RAM: %d bytes (used: %d)", 
+             (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), 
+             (int)(mem_start - heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
 
     // Initialize the TCP/IP stack and WiFi driver
+    ESP_LOGI(TAG, "wifi_manager: initializing netif...");
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     wifiAP = esp_netif_create_default_wifi_ap();
     wifiSTA = esp_netif_create_default_wifi_sta();
+    ESP_LOGI(TAG, "wifi_manager: netif init done, free internal RAM: %d bytes (used: %d)", 
+             (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), 
+             (int)(mem_start - heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
 
     // Initialize WiFi with default settings
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
 
+    ESP_LOGI(TAG, "wifi_manager: initializing WiFi driver...");
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_LOGI(TAG, "wifi_manager: WiFi driver init done, free internal RAM: %d bytes (used: %d)", 
+             (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), 
+             (int)(mem_start - heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
 
     // configure country based on saved setting
     static const struct { const char *code; uint8_t schan; uint8_t nchan; } country_table[] = {
@@ -1799,13 +1817,19 @@ void wifi_manager_init(void) {
 #endif
 
     // Create the WiFi event group
+    ESP_LOGI(TAG, "wifi_manager: creating event group...");
     wifi_event_group = xEventGroupCreate();
+    ESP_LOGI(TAG, "wifi_manager: event group created, free internal RAM: %d bytes", 
+             (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
     // Register the event handler for WiFi events
+    ESP_LOGI(TAG, "wifi_manager: registering event handlers...");
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                                         &wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                                         &wifi_event_handler, NULL, NULL));
+    ESP_LOGI(TAG, "wifi_manager: event handlers registered, free internal RAM: %d bytes", 
+             (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
     // AP-side diagnostics (connect/disconnect + dhcp assignment). helps debug portal connect failures.
     if (!g_ap_diag_registered) {
@@ -1822,9 +1846,13 @@ void wifi_manager_init(void) {
     }
 
     // Set WiFi mode to STA (station)
+    ESP_LOGI(TAG, "wifi_manager: setting WiFi mode to APSTA...");
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_LOGI(TAG, "wifi_manager: WiFi mode set, free internal RAM: %d bytes", 
+             (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
     // Configure the SoftAP settings
+    ESP_LOGI(TAG, "wifi_manager: configuring AP...");
     wifi_config_t ap_config = {
         .ap = {.ssid = "",
                .ssid_len = strlen(""),
@@ -1837,8 +1865,12 @@ void wifi_manager_init(void) {
 
     // Apply the AP configuration
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+    
     // Start the Wi-Fi AP
+    ESP_LOGI(TAG, "wifi_manager: starting WiFi (esp_wifi_start)...");
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_LOGI(TAG, "wifi_manager: WiFi started, free internal RAM: %d bytes", 
+             (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     
     // Additional WiFi stability settings
     // Set maximum TX power to improve signal strength
@@ -1848,12 +1880,19 @@ void wifi_manager_init(void) {
     esp_wifi_set_inactive_time(WIFI_IF_STA, 60); // 60 seconds before considering connection inactive
 
     // Initialize global CA certificate store
+    ESP_LOGI(TAG, "wifi_manager: attaching CA certificate bundle...");
     ret = esp_crt_bundle_attach(NULL);
     if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "wifi_manager: CA bundle attached, free internal RAM: %d bytes", 
+                 (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         printf("Global CA certificate store initialized successfully.\n");
     } else {
         printf("Failed to initialize global CA certificate store: %s\n", esp_err_to_name(ret));
     }
+    
+    size_t mem_end = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    ESP_LOGI(TAG, "wifi_manager_init: COMPLETE. Total used: %d bytes, free internal RAM: %d bytes", 
+             (int)(mem_start - mem_end), (int)mem_end);
 }
 
 void wifi_manager_configure_sta_from_settings(void) {
@@ -3250,7 +3289,7 @@ static void wireshark_channel_hop_timer_callback(void *arg) {
     // determine if 5ghz or 2.4ghz
     wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
     
-    #if defined(CONFIG_IDF_TARGET_ESP32C5) || defined(CONFIG_IDF_TARGET_ESP32C6)
+    #if defined(CONFIG_IDF_TARGET_ESP32C5)
     if (channel > 14) {
         // 5ghz channel - use ht40
         second = WIFI_SECOND_CHAN_ABOVE;
@@ -3526,7 +3565,15 @@ bool wifi_manager_is_channel_switch_attack_running(void) {
 void wifi_manager_set_html_from_uart(void) {
     use_html_buffer = true;
     if (html_buffer == NULL) {
+#if CONFIG_SPIRAM
+        html_buffer = (char*)heap_caps_malloc(MAX_HTML_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (html_buffer == NULL) {
+            ESP_LOGW(TAG, "PSRAM html_buffer failed, trying internal RAM");
+            html_buffer = (char*)malloc(MAX_HTML_BUFFER_SIZE);
+        }
+#else
         html_buffer = (char*)malloc(MAX_HTML_BUFFER_SIZE);
+#endif
         if (html_buffer == NULL) {
             printf("Failed to allocate HTML buffer\n");
             use_html_buffer = false;
@@ -3739,12 +3786,23 @@ static void karma_stop_portal_if_active(void) {
 static void karma_task(void *param) {
     printf("Karma attack started\n");
     TERMINAL_VIEW_ADD_TEXT("Karma attack started\n");
+
+    // Enable promiscuous mode for capturing probe requests
     wifi_promiscuous_filter_t filter = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
-    esp_wifi_set_promiscuous_filter(&filter);
-    esp_wifi_set_promiscuous(true);
+    esp_err_t err = esp_wifi_set_promiscuous_filter(&filter);
+    if (err != ESP_OK) {
+        printf("Karma: failed to set promiscuous filter: %s\n", esp_err_to_name(err));
+    }
+    err = esp_wifi_set_promiscuous(true);
+    if (err != ESP_OK) {
+        printf("Karma: failed to enable promiscuous mode: %s\n", esp_err_to_name(err));
+    }
     esp_wifi_set_promiscuous_rx_cb(karma_probe_request_callback);
 
     last_ssid_change_time = esp_timer_get_time() / 1000;
+
+    printf("Karma: entering loop, ssid_count=%d, ap_sta_has_ip=%d\n", karma_ssid_count, ap_sta_has_ip);
+    fflush(stdout);
 
     // If only one SSID, set it once and don't rotate
     if (karma_ssid_count == 1) {
@@ -3759,15 +3817,19 @@ static void karma_task(void *param) {
             }
         };
         strncpy((char *)ap_config.ap.ssid, karma_ssid_cache[0], 32);
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
-        ESP_ERROR_CHECK(esp_wifi_start());
+        err = esp_wifi_set_mode(WIFI_MODE_AP);
+        if (err != ESP_OK) printf("Karma: set_mode failed: %s\n", esp_err_to_name(err));
+        err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+        if (err != ESP_OK) printf("Karma: set_config failed: %s\n", esp_err_to_name(err));
+        err = esp_wifi_start();
+        if (err != ESP_OK) printf("Karma: start failed: %s\n", esp_err_to_name(err));
         printf("Karma using single SSID: %s\n", karma_ssid_cache[0]);
         TERMINAL_VIEW_ADD_TEXT("Karma using single SSID: %s\n", karma_ssid_cache[0]);
         karma_start_portal_for_ssid(karma_ssid_cache[0]);
     }
 
     while (karma_running) {
+        printf("Karma: loop start, ssid_count=%d, ap_sta_has_ip=%d\n", karma_ssid_count, ap_sta_has_ip);
         uint32_t now = esp_timer_get_time() / 1000;
         // Only rotate if more than one SSID
         if (!ap_sta_has_ip && karma_ssid_count > 1 && (now - last_ssid_change_time > 5000)) {
@@ -3782,22 +3844,23 @@ static void karma_task(void *param) {
                 }
             };
             strncpy((char *)ap_config.ap.ssid, karma_ssid_cache[karma_ssid_index], 32);
-            ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+            err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+            if (err != ESP_OK) printf("Karma: set_config failed: %s\n", esp_err_to_name(err));
             printf("Karma rotating to SSID: %s\n", karma_ssid_cache[karma_ssid_index]);
             TERMINAL_VIEW_ADD_TEXT("Karma rotating to SSID: %s\n", karma_ssid_cache[karma_ssid_index]);
             karma_start_portal_for_ssid(karma_ssid_cache[karma_ssid_index]);
             karma_ssid_index = (karma_ssid_index + 1) % karma_ssid_count;
             last_ssid_change_time = now;
         }
-    
+     
         // Send beacon frames for all cached SSIDs (every 500ms)
         if (!ap_sta_has_ip) {
             for (int i = 0; i < karma_ssid_count; ++i) {
-                wifi_manager_broadcast_ap(karma_ssid_cache[i]);
+                beacon_spam_broadcast_karma(karma_ssid_cache[i]);
                 vTaskDelay(pdMS_TO_TICKS(10)); // Small delay between beacons
             }
         }
-    
+     
         vTaskDelay(pdMS_TO_TICKS(500));
     }
     esp_wifi_set_promiscuous(false);
@@ -3817,14 +3880,15 @@ void wifi_manager_start_karma(void) {
         karma_ssid_count = 0;
         karma_ssid_index = 0;
     }
+    karma_running = true;
     BaseType_t rc = xTaskCreate(karma_task, "karma_task", 4096, NULL, 5, &karma_task_handle);
     if (rc != pdPASS) {
         printf("Failed to start Karma task (%ld)\n", (long)rc);
         TERMINAL_VIEW_ADD_TEXT("Failed to start Karma task\n");
+        karma_running = false;
         karma_task_handle = NULL;
         return;
     }
-    karma_running = true;
 }
 
 void wifi_manager_stop_karma(void) {
@@ -3843,10 +3907,17 @@ void wifi_manager_stop_karma(void) {
         vTaskDelay(pdMS_TO_TICKS(100));
         wait_count++;
     }
+
     if (karma_task_handle != NULL) {
         vTaskDelete(karma_task_handle);
         karma_task_handle = NULL;
     }
+    printf("Karma attack stopped\n");
+    TERMINAL_VIEW_ADD_TEXT("Karma attack stopped\n");
+}
+
+bool wifi_manager_karma_is_running(void) {
+    return karma_running;
 }
 
 // rssi tracking for selected ap and sta
